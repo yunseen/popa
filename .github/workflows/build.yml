@@ -1,0 +1,217 @@
+name: MattGram build
+
+# Собирает MattGram из исходников этого репозитория (Telegram-iOS 12.9.2 + наши правки) в IPA без подписи. Кэш Bazel сохраняется ДАЖЕ ЕСЛИ сборка не успела закончиться:
+# если вышло время (5 часов), следующий запуск стартует автоматически и продолжает с кэша.
+
+on:
+  workflow_dispatch:
+    inputs:
+      attempt:
+        description: "Номер попытки (ставится автоматически)"
+        required: false
+        default: "1"
+      bundle_id:
+        description: "Bundle ID итогового IPA"
+        required: false
+        default: "app.mattgram.ios"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: mattgram-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_TAG: release-13.2
+  FINAL_BUNDLE_ID: ${{ github.event.inputs.bundle_id || 'app.mattgram.ios' }}
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 355
+    steps:
+      - name: Checkout (исходники Telegram-iOS + MattGram)
+        uses: actions/checkout@v4
+        with:
+          path: src
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode
+        run: |
+          cd src
+          XCODE_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')
+          echo "Xcode $XCODE_VERSION"
+          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Restore Bazel cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            bazel-cache-
+
+      - name: Write build configuration (без Team ID, ключи из секретов)
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          set -e
+          cd src
+          if [ -z "$TG_API_ID" ] || [ -z "$TG_API_HASH" ]; then
+            echo "::error::Секреты TG_API_ID / TG_API_HASH не заданы. Запусти скрипт Запустить-сборку.ps1"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json, os, re
+          if not re.fullmatch(r"[0-9]{5,10}", os.environ["TG_API_ID"].strip()):
+              raise SystemExit("::error::TG_API_ID должен состоять из цифр (с my.telegram.org)")
+          if not re.fullmatch(r"[0-9a-fA-F]{32}", os.environ["TG_API_HASH"].strip()):
+              raise SystemExit("::error::TG_API_HASH должен быть 32 hex-символа (с my.telegram.org)")
+          print("API-ключи на месте и в правильном формате")
+          # Сборочные идентификаторы остаются стоковыми, чтобы подошли встроенные «фейковые» профили.
+          # Итоговый bundle id и подпись меняются на шаге «Finalize IPA» ниже, Team ID в IPA не остаётся.
+          cfg = {
+            "bundle_id": "ph.telegra.Telegraph",
+            "api_id": os.environ["TG_API_ID"].strip(),
+            "api_hash": os.environ["TG_API_HASH"].strip(),
+            "team_id": "C67CF9S4VU",
+            "app_center_id": "0",
+            "is_internal_build": "false",
+            "is_appstore_build": "false",
+            "appstore_id": "0",
+            "app_specific_url_scheme": "tg",
+            "premium_iap_product_id": "",
+            "enable_siri": False,
+            "enable_icloud": False
+          }
+          json.dump(cfg, open("build-system/mattgram-configuration.json", "w"), indent=2)
+          PY
+
+      - name: Build IPA
+        id: build
+        run: |
+          set -x
+          cd src
+          mkdir -p ~/telegram-bazel-cache
+          # Номер сборки MattGram: файл BUILD_NUMBER в корне репозитория (1, 2, 3 ...), по одному на каждую сборку
+          BUILD_NUMBER=$(tr -d '[:space:]' < BUILD_NUMBER)
+          echo "Номер сборки MattGram: $BUILD_NUMBER"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
+          # У «фейковых» профилей подписи из репозитория Telegram срок действия истёк (2026-10-30), Bazel из-за этого падает.
+          # Подпись в итоговом IPA всё равно убирается, поэтому продлеваем срок: та же длина строки, подпись профиля не проверяется.
+          python3 - <<'PYX'
+          import glob
+          fixed = 0
+          for f in glob.glob("build-system/fake-codesigning/profiles/*.mobileprovision"):
+              data = open(f, "rb").read()
+              new = data.replace(b"2026-10-30T17:06:30Z", b"2036-10-30T17:06:30Z")
+              if new != data:
+                  open(f, "wb").write(new)
+                  fixed += 1
+          print("профилей продлено:", fixed)
+          PYX
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          set +e
+          # 17400 с = 4 ч 50 мин. Если не успели — кэш сохранится, и сборка продолжится новым запуском.
+          perl -e 'alarm shift; exec @ARGV' 17400 \
+            python3 -u build-system/Make/Make.py \
+              --cacheDir="$HOME/telegram-bazel-cache" \
+              build \
+              --configurationPath=build-system/mattgram-configuration.json \
+              --codesigningInformationPath=build-system/fake-codesigning \
+              --configuration=release_arm64 \
+              --buildNumber="$BUILD_NUMBER" \
+              --outputBuildArtifactsPath="$GITHUB_WORKSPACE/out/artifacts" 2>&1 | tee /tmp/build.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "exit code: $code"
+          # 142 = SIGALRM (время вышло)
+          if [ "$code" = "142" ] || [ "$code" = "124" ] || [ "$code" = "137" ] || [ "$code" = "143" ]; then
+            echo "timedout=true" >> $GITHUB_OUTPUT
+            echo "result=timeout" >> $GITHUB_OUTPUT
+          elif [ "$code" = "0" ]; then
+            echo "timedout=false" >> $GITHUB_OUTPUT
+            echo "result=ok" >> $GITHUB_OUTPUT
+          else
+            echo "timedout=false" >> $GITHUB_OUTPUT
+            echo "result=fail" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Save Bazel cache (всегда, даже при ошибке и таймауте)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/telegram-bazel-cache
+          key: bazel-cache-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Finalize IPA (убрать подпись и Team ID, поставить bundle id)
+        if: steps.build.outputs.result == 'ok'
+        run: |
+          set -e
+          cd src
+          mkdir -p ../out
+          # Официальный путь, который Make.py копирует сам: out/artifacts/Telegram.ipa (запасной — bazel-bin/Telegram/Telegram.ipa)
+          IPA="$GITHUB_WORKSPACE/out/artifacts/Telegram.ipa"
+          if [ ! -f "$IPA" ]; then IPA="bazel-bin/Telegram/Telegram.ipa"; fi
+          if [ ! -f "$IPA" ]; then
+            echo "::error::IPA не найден ни в out/artifacts, ни в bazel-bin/Telegram"
+            find . -name "Telegram.ipa" -not -path "./third-party/*" 2>/dev/null | head
+            exit 1
+          fi
+          echo "IPA: $IPA"
+          cp "$IPA" ../out/Telegram-raw.ipa
+          cd ../out && rm -rf work && mkdir work && cd work
+          unzip -q ../Telegram-raw.ipa
+          python3 "$GITHUB_WORKSPACE/src/tools/finalize_ipa.py" Payload "$FINAL_BUNDLE_ID"
+          # Убираем подпись из самих файлов (там остаётся Team ID сборки): Sideloadly подпишет заново своим сертификатом
+          find Payload \( -name "*.app" -o -name "*.appex" -o -name "*.framework" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' item; do
+            codesign --remove-signature "$item" 2>/dev/null || true
+          done
+          echo "Остатки Team ID в IPA (должно быть 0):"
+          grep -rl "C67CF9S4VU" Payload 2>/dev/null | wc -l || true
+          zip -qry "../MattGram-${BUILD_NUMBER}.ipa" Payload
+          ls -la ..
+
+      - name: Upload IPA
+        if: steps.build.outputs.result == 'ok'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MattGram-IPA
+          path: out/MattGram-*.ipa
+          retention-days: 30
+
+      - name: Continue in a new run (если время вышло)
+        if: steps.build.outputs.timedout == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEXT=$(( ${{ github.event.inputs.attempt || 1 }} + 1 ))
+          if [ "$NEXT" -le 8 ]; then
+            echo "Время вышло, кэш сохранён. Запускаю попытку $NEXT."
+            gh workflow run build.yml --repo "$GITHUB_REPOSITORY" -f attempt="$NEXT" -f bundle_id="$FINAL_BUNDLE_ID"
+          else
+            echo "::error::Слишком много попыток"
+            exit 1
+          fi
+
+      - name: Fail if build failed
+        if: steps.build.outputs.result == 'fail'
+        run: |
+          echo "::error::Сборка упала. Лог — в артефакте build-log, последние строки ниже."
+          tail -n 80 /tmp/build.log
+          exit 1
