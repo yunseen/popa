@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 public extension Notification.Name {
     static let mattgramSettingsDidChange = Notification.Name("mattgramSettingsDidChange")
@@ -33,6 +34,85 @@ public final class MGSettings {
 
     public func setEnabled(feature id: Int, _ value: Bool) {
         self.setBool(self.key(id), value)
+    }
+
+    // MARK: Значения по строковому id (id берутся из схемы настроек, ключ `mg_<id>`)
+
+    public func named(_ id: String) -> String {
+        return MGSettings.prefix + id
+    }
+
+    public func bool(named id: String, default value: Bool = false) -> Bool {
+        return self.bool(self.named(id), default: value)
+    }
+
+    public func setBool(named id: String, _ value: Bool) {
+        self.setBool(self.named(id), value)
+    }
+
+    public func int(named id: String, default value: Int) -> Int {
+        let key = self.named(id)
+        if defaults.object(forKey: key) == nil {
+            return value
+        }
+        return defaults.integer(forKey: key)
+    }
+
+    public func setInt(named id: String, _ value: Int) {
+        defaults.set(value, forKey: self.named(id))
+        NotificationCenter.default.post(name: .mattgramSettingsDidChange, object: nil, userInfo: ["key": self.named(id)])
+    }
+
+    public func string(named id: String, default value: String) -> String {
+        return defaults.string(forKey: self.named(id)) ?? value
+    }
+
+    public func setString(named id: String, _ value: String) {
+        defaults.set(value, forKey: self.named(id))
+        NotificationCenter.default.post(name: .mattgramSettingsDidChange, object: nil, userInfo: ["key": self.named(id)])
+    }
+
+    public func remove(named id: String) {
+        defaults.removeObject(forKey: self.named(id))
+        NotificationCenter.default.post(name: .mattgramSettingsDidChange, object: nil)
+    }
+
+    // MARK: Резервная копия в Keychain
+
+    private static let keychainService = "app.mattgram.settings"
+
+    @discardableResult
+    public func saveToKeychain() -> Bool {
+        guard let data = self.exportJSON().data(using: .utf8) else {
+            return false
+        }
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: MGSettings.keychainService,
+            kSecAttrAccount as String: "backup"
+        ]
+        SecItemDelete(base as CFDictionary)
+        var item = base
+        item[kSecValueData as String] = data
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+    }
+
+    /// Возвращает количество восстановленных параметров (0 — копии нет).
+    @discardableResult
+    public func restoreFromKeychain() -> Int {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: MGSettings.keychainService,
+            kSecAttrAccount as String: "backup",
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess, let data = result as? Data, let string = String(data: data, encoding: .utf8) else {
+            return 0
+        }
+        return self.importJSON(string)
     }
 
     /// Номер сборки (CFBundleVersion).

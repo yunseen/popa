@@ -68,13 +68,18 @@ jobs:
             exit 1
           fi
           python3 - <<'PY'
-          import json, os
+          import json, os, re
+          if not re.fullmatch(r"[0-9]{5,10}", os.environ["TG_API_ID"].strip()):
+              raise SystemExit("::error::TG_API_ID должен состоять из цифр (с my.telegram.org)")
+          if not re.fullmatch(r"[0-9a-fA-F]{32}", os.environ["TG_API_HASH"].strip()):
+              raise SystemExit("::error::TG_API_HASH должен быть 32 hex-символа (с my.telegram.org)")
+          print("API-ключи на месте и в правильном формате")
           # Сборочные идентификаторы остаются стоковыми, чтобы подошли встроенные «фейковые» профили.
           # Итоговый bundle id и подпись меняются на шаге «Finalize IPA» ниже, Team ID в IPA не остаётся.
           cfg = {
             "bundle_id": "ph.telegra.Telegraph",
-            "api_id": os.environ["TG_API_ID"],
-            "api_hash": os.environ["TG_API_HASH"],
+            "api_id": os.environ["TG_API_ID"].strip(),
+            "api_hash": os.environ["TG_API_HASH"].strip(),
             "team_id": "C67CF9S4VU",
             "app_center_id": "0",
             "is_internal_build": "false",
@@ -94,7 +99,9 @@ jobs:
           set -x
           cd src
           mkdir -p ~/telegram-bazel-cache
-          BUILD_NUMBER=$(( ${{ github.run_number }} + $(cat build_number_offset) ))
+          # Номер сборки MattGram: файл BUILD_NUMBER в корне репозитория (1, 2, 3 ...), по одному на каждую сборку
+          BUILD_NUMBER=$(tr -d '[:space:]' < BUILD_NUMBER)
+          echo "Номер сборки MattGram: $BUILD_NUMBER"
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           set +e
@@ -106,7 +113,8 @@ jobs:
               --configurationPath=build-system/mattgram-configuration.json \
               --codesigningInformationPath=build-system/fake-codesigning \
               --configuration=release_arm64 \
-              --buildNumber="$BUILD_NUMBER" 2>&1 | tee /tmp/build.log
+              --buildNumber="$BUILD_NUMBER" \
+              --outputBuildArtifactsPath="$GITHUB_WORKSPACE/out/artifacts" 2>&1 | tee /tmp/build.log
           code=${PIPESTATUS[0]}
           set -e
           echo "exit code: $code"
@@ -144,11 +152,25 @@ jobs:
           set -e
           cd src
           mkdir -p ../out
-          IPA=$(ls bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa | head -1)
+          # Официальный путь, который Make.py копирует сам: out/artifacts/Telegram.ipa (запасной — bazel-bin/Telegram/Telegram.ipa)
+          IPA="$GITHUB_WORKSPACE/out/artifacts/Telegram.ipa"
+          if [ ! -f "$IPA" ]; then IPA="bazel-bin/Telegram/Telegram.ipa"; fi
+          if [ ! -f "$IPA" ]; then
+            echo "::error::IPA не найден ни в out/artifacts, ни в bazel-bin/Telegram"
+            find . -name "Telegram.ipa" -not -path "./third-party/*" 2>/dev/null | head
+            exit 1
+          fi
+          echo "IPA: $IPA"
           cp "$IPA" ../out/Telegram-raw.ipa
           cd ../out && rm -rf work && mkdir work && cd work
           unzip -q ../Telegram-raw.ipa
           python3 "$GITHUB_WORKSPACE/src/tools/finalize_ipa.py" Payload "$FINAL_BUNDLE_ID"
+          # Убираем подпись из самих файлов (там остаётся Team ID сборки): Sideloadly подпишет заново своим сертификатом
+          find Payload \( -name "*.app" -o -name "*.appex" -o -name "*.framework" -o -name "*.dylib" \) -print0 | while IFS= read -r -d '' item; do
+            codesign --remove-signature "$item" 2>/dev/null || true
+          done
+          echo "Остатки Team ID в IPA (должно быть 0):"
+          grep -rl "C67CF9S4VU" Payload 2>/dev/null | wc -l || true
           zip -qry "../MattGram-${BUILD_NUMBER}.ipa" Payload
           ls -la ..
 

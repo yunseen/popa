@@ -14,6 +14,16 @@ OLD = "ph.telegra.Telegraph"
 def main():
     payload, new = sys.argv[1], sys.argv[2]
     renamed = 0
+    # Расширения (Share, виджеты, уведомления, Siri) и часы требуют App Group и отдельных App ID,
+    # которых нет у бесплатного аккаунта: Sideloadly на них падает. Основное приложение работает и без них.
+    if os.environ.get("KEEP_EXTENSIONS") != "1":
+        for name in os.listdir(payload):
+            app = os.path.join(payload, name)
+            for sub in ("PlugIns", "Watch", "Extensions"):
+                path = os.path.join(app, sub)
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                    print("удалено:", path)
     for root, dirs, files in os.walk(payload):
         # подпись и профили не нужны: Sideloadly подпишет заново своим сертификатом
         for d in list(dirs):
