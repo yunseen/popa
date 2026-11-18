@@ -104,17 +104,33 @@ jobs:
           echo "Номер сборки MattGram: $BUILD_NUMBER"
           echo "BUILD_NUMBER=$BUILD_NUMBER" >> $GITHUB_ENV
           # У «фейковых» профилей подписи из репозитория Telegram срок действия истёк (2026-10-30), Bazel из-за этого падает.
-          # Подпись в итоговом IPA всё равно убирается, поэтому продлеваем срок: та же длина строки, подпись профиля не проверяется.
+          # Подпись в итоговом IPA всё равно убирается, поэтому продлеваем срок и заново подписываем профили тем же самоподписанным сертификатом.
           python3 - <<'PYX'
-          import glob
+          import glob, subprocess
+          P = "build-system/fake-codesigning"
+          ok = False
+          for extra in ([], ["-legacy"]):
+              r = subprocess.run(["/usr/bin/openssl", "pkcs12"] + extra + ["-in", P + "/certs/SelfSigned.p12", "-nodes", "-passin", "pass:", "-out", "/tmp/mg_id.pem"], capture_output=True)
+              if r.returncode == 0:
+                  ok = True
+                  break
+          if not ok:
+              raise SystemExit("::error::не удалось прочитать SelfSigned.p12")
           fixed = 0
-          for f in glob.glob("build-system/fake-codesigning/profiles/*.mobileprovision"):
-              data = open(f, "rb").read()
-              new = data.replace(b"2026-10-30T17:06:30Z", b"2036-10-30T17:06:30Z")
-              if new != data:
-                  open(f, "wb").write(new)
-                  fixed += 1
-          print("профилей продлено:", fixed)
+          for f in sorted(glob.glob(P + "/profiles/*.mobileprovision")):
+              r = subprocess.run(["/usr/bin/openssl", "smime", "-inform", "der", "-verify", "-noverify", "-in", f], capture_output=True)
+              plist = r.stdout
+              if b"2026-10-30T17:06:30Z" not in plist:
+                  continue
+              open("/tmp/mg_p.plist", "wb").write(plist.replace(b"2026-10-30T17:06:30Z", b"2036-10-30T17:06:30Z"))
+              r = subprocess.run(["/usr/bin/openssl", "smime", "-sign", "-signer", "/tmp/mg_id.pem", "-inkey", "/tmp/mg_id.pem", "-in", "/tmp/mg_p.plist", "-outform", "der", "-nodetach", "-binary", "-out", f], capture_output=True)
+              if r.returncode != 0:
+                  raise SystemExit("::error::не удалось подписать " + f + ": " + r.stderr.decode())
+              chk = subprocess.run(["/usr/bin/openssl", "smime", "-inform", "der", "-verify", "-noverify", "-in", f], capture_output=True)
+              if chk.returncode != 0 or b"2036-10-30T17:06:30Z" not in chk.stdout:
+                  raise SystemExit("::error::профиль не прошёл проверку после подписи: " + f)
+              fixed += 1
+          print("профилей продлено и переподписано:", fixed)
           PYX
           python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
           set +e
